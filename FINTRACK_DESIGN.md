@@ -21,15 +21,16 @@
 11. [Monthly Summary](#11-monthly-summary)
 12. [Export System](#12-export-system)
 13. [Session Management](#13-session-management)
-14. [Income vs Expense Logic](#14-income-vs-expense-logic)
-15. [Key Design Decisions](#15-key-design-decisions)
-16. [Known Patterns & Edge Cases](#16-known-patterns--edge-cases)
+14. [Income vs Expense vs Transfer Logic](#14-income-vs-expense-vs-transfer-logic)
+15. [Transaction Grouping (Year/Month)](#15-transaction-grouping-yearmonth)
+16. [Key Design Decisions](#16-key-design-decisions)
+17. [Known Patterns & Edge Cases](#17-known-patterns--edge-cases)
 
 ---
 
 ## 1. Project Overview
 
-Fintrack is a single self-contained HTML file (~3,000 lines) for personal finance tracking. It imports bank and credit card CSV files, auto-categorises transactions using a statistical learning engine, and provides dashboards, monthly summaries, and export capabilities.
+Fintrack is a single self-contained HTML file (~3,100 lines) for personal finance tracking. It imports bank and credit card CSV files, auto-categorises transactions using a statistical learning engine, and provides dashboards, monthly summaries, and export capabilities.
 
 **Core constraints:**
 - No server — runs entirely in the browser from a local file
@@ -44,10 +45,11 @@ Fintrack is a single self-contained HTML file (~3,000 lines) for personal financ
 finance-tracker.html
 ├── <style>          CSS (variables, layout, components)
 ├── <body>           Shell: sidebar nav + topbar + content div
-└── <script>         All application logic (~2,500 lines JS)
+└── <script>         All application logic (~2,700 lines JS)
     ├── State management   (emptyState, saveState, loadSnapshot)
     ├── Utility functions  (fmt, escAttr, escJS, parseDate, etc.)
     ├── Learning engine    (descNgrams, updateStats, guessGroup)
+    ├── Income/transfer    (isIncomeGroup, isTransferGroup, monthlyGroupTotals)
     ├── Page renderers     (renderDashboard, renderTransactions, ...)
     ├── Import handlers    (handleBankFile, confirmImport, ...)
     ├── Export handlers    (doExport, doGroupExport, ...)
@@ -76,8 +78,8 @@ The transactions page uses a special `tx-mode` layout where `#content` becomes a
 state = {
   groups:        Group[],
   transactions:  Transaction[],
-  learned:       { [ngram: string]: groupName },      // fast lookup
-  learned_stats: { [ngram: string]: { [groupName]: count } }  // raw vote counts
+  learned:       { [ngram: string]: groupName },
+  learned_stats: { [ngram: string]: { [groupName]: count } }
 }
 ```
 
@@ -85,38 +87,45 @@ state = {
 
 ```javascript
 {
-  id:       number,    // auto-incrementing
-  name:     string,
-  color:    string,    // hex color from PALETTE
-  isIncome: boolean    // true = counted as income in summaries
-                       // undefined = auto-detect from name (משכורת = income)
+  id:         number,    // auto-incrementing
+  name:       string,
+  color:      string,    // hex color from PALETTE
+  isIncome:   boolean,   // true = counted as income in summaries
+  isTransfer: boolean    // true = excluded from income/expense totals
 }
 ```
+
+**Group type detection (auto-fallback for old saves):**
+- `isTransfer: true` → transfer group (excluded from Income/Expense)
+- `isIncome: true` → income group
+- `isIncome: undefined` + name contains `'משכורת'` → treated as income
+- `isTransfer: undefined` + name starts with `'Transfer to'` → treated as transfer
+- Otherwise → expense group
 
 ### Transaction
 
 ```javascript
 {
-  id:          string,   // "tx-NNN"
-  date:        string,   // "YYYY-MM-DD"
-  desc:        string,   // cleaned merchant name
-  amount:      number,   // negative = expense, positive = income
-  groupId:     number|null,
-  source:      string,   // "Bank" | "Credit"
-  comment:     string,
-  edited:      boolean,
-  isNew:       boolean,
-  disabled:    boolean,  // excluded from all calculations
-  splitParent: boolean,  // disabled split origin row
-  splitIntoTwo:boolean,  // disabled via "split into 2" action
-  instalmentOf:string,   // parent tx id (instalment child)
-  splitFromId: string    // parent tx id (split-into-2 child)
+  id:           string,   // "tx-NNN"
+  date:         string,   // "YYYY-MM-DD"
+  desc:         string,   // cleaned merchant name
+  amount:       number,   // negative = expense, positive = income
+  groupId:      number|null,
+  source:       string,   // "Bank" | "Credit"
+  comment:      string,
+  edited:       boolean,
+  isNew:        boolean,
+  disabled:     boolean,  // excluded from all calculations
+  splitParent:  boolean,  // disabled split origin row
+  splitIntoTwo: boolean,  // disabled via "split into 2" action
+  instalmentOf: string,   // parent tx id (instalment child)
+  splitFromId:  string    // parent tx id (split-into-2 child)
 }
 ```
 
 ### Persistence
 
-- `fintrack_saves` — JSON array of `{id, name, savedAt}` (snapshot index)
+- `fintrack_saves` — JSON array of `{id, name, savedAt, txCount}` (snapshot index)
 - `fintrack_save_<id>` — full serialised `state` for each snapshot
 - `fintrack_last` — id of last opened snapshot (auto-resume)
 
@@ -133,8 +142,6 @@ state = {
 | Group Management | `groups` | `renderGroups()` |
 | Import | `import` | `renderImport()` |
 | Export | `export` | `renderExport()` |
-| Save Session | `session` | (welcome screen) |
-| Recent Files | `recent` | (welcome screen) |
 
 `showPage(p)` handles nav highlight, title update, and calls the renderer. On leaving the transactions page it removes the `tx-mode` class from `#content`.
 
@@ -152,158 +159,132 @@ state = {
 
 Two-pass matching:
 1. Exact match on lowercased header
-2. Fuzzy match — but guards against `description` matching `extended description` by skipping headers that contain a longer candidate name
+2. Fuzzy match — guards against `description` matching `extended description`
 
 ### Description Selection
 
 Always picks the **longer** of `description` vs `extended description` columns. This handles two opposite bank conventions:
-- Credit card A: `extended description` has full merchant name, `description` is short
+- Credit card A: `extended description` has full merchant name
 - Checking bank: `description` has full text, `extended description` is truncated
 
 ### Description Cleaning (`cleanDesc`)
 
-Strips common bank prefixes using regex:
-```
-"Ext Credit Card Debit TRADER JOE S #127 LOS ALTOS CA"
-  → "TRADER JOE S #127 LOS ALTOS CA"
-
-"Withdrawal: Leviner Pmt to *8918 Choice Rewards World MC"
-  → "Leviner Pmt to *8918 Choice Rewards World MC"
-```
-
-Handles both `Withdrawal ` (space) and `Withdrawal:` (colon) variants.
+Strips common bank prefixes. Handles both `Withdrawal ` (space) and `Withdrawal:` (colon) variants, `ACH Debit/Deposit`, `POS Transaction`, `Ext Credit Card Debit/Credit`, `Descriptive Deposit/Withdrawal`, `Deposit:`.
 
 ### Sign Validation
 
-The expected convention is: **Debit = negative amount, Credit = positive amount**.
+Expected convention: **Debit = negative, Credit = positive**.
 
-After parsing, the code checks `Transaction Type` column. If violations found (Debit + positive, or Credit + negative), the import is **blocked** with a clear error message asking the user to re-download from the bank.
+After parsing, checks `Transaction Type` column. If violations found, import is **blocked** with error asking user to re-download from bank.
 
 ### Review Table
 
-Before committing, all rows are shown in a review table with:
+Before committing, all rows shown with:
 - Status badge (new / already exists)
 - Editable date, read-only description with ✎ edit button, editable amount, group dropdown
 - Skip/Include toggle per row
-- Duplicate rows (same date + amount + desc) pre-highlighted and pre-skipped
-- Bulk controls: "Skip all duplicates" / "Include all"
+- Duplicate rows pre-highlighted and pre-skipped
+- Bulk: "Skip all duplicates" / "Include all"
 
-**Critical implementation detail:** All inputs in the review table use `oninput` (not `onchange`) to prevent browsers firing change events during chunk-based DOM insertion.
+**Critical:** All inputs use `oninput` (not `onchange`) to prevent browsers firing change events during chunk-based DOM insertion, which was corrupting amount signs.
 
 ### Chunk Rendering
 
-With 177+ rows, building one giant `innerHTML` string caused browser crashes. The review tbody is populated in chunks of 40 rows using `setTimeout(renderChunk, 0)` between chunks, yielding control to the browser between batches.
-
-### Duplicate Detection
-
-`buildDupSet()` creates a Set of transaction IDs matching existing records by `date + amount + desc.trim().toLowerCase()`. Split parents and instalments are excluded.
+Review tbody populated in chunks of 40 rows using `setTimeout(renderChunk, 0)` between batches.
 
 ---
 
 ## 6. Transaction Table
 
-### Layout
+### Layout (tx-mode)
 
-`tx-mode` layout:
 ```
 #content (flex column, overflow:hidden)
   └─ .tx-page
-       ├─ .tx-header (flex-shrink:0 — never scrolls)
+       ├─ .tx-header (sticky — never scrolls)
        │    ├─ stat cards
        │    ├─ copy/dup banners
-       │    ├─ toolbar (search + filters + add button)
+       │    ├─ toolbar (search + filters + expand/collapse + add)
        │    └─ bulk bar
-       └─ #tx-scroll (flex:1, overflow-y:auto — only this scrolls)
+       └─ #tx-scroll (only this scrolls)
             └─ table with sticky thead
 ```
 
+### Year/Month Grouping
+
+Transactions are grouped into collapsible year and month rows:
+
+```
+▼ 2026  [12 months · 847 tx]  Income: +$141k  Expenses: -$156k  Net: -$14k
+  ▼ June 2026  [28 tx]  Income: +$20,817  Expenses: -$24,697  Net: -$3,879
+    ☐  01-Jun-2026  Credit Dividend  +0.10  ...
+  ▶ May 2026  [31 tx]  ...
+▶ 2025  [2 months · 134 tx]  ...
+```
+
+**State:** `expandedYears: Set<string>`, `expandedMonths: Set<string>` — module-level, persist across re-renders. Auto-expands most recent year+month on first load.
+
+**Multiple open simultaneously:** clicking a year/month toggles it independently. Collapsing a year also collapses all its months.
+
+**Toolbar:** `⊞ All` expands everything, `⊟ All` collapses everything.
+
 ### Scroll Preservation
 
-`txScrollPos` is a module-level variable that persists across re-renders. Saved from `#tx-scroll.scrollTop` at the start of `renderTransactions()`, restored after innerHTML replacement (both immediately and in a `requestAnimationFrame` fallback).
-
-Resets to 0 on: sort column click, filter change, search input.
+`txScrollPos` is module-level. Saved from `#tx-scroll.scrollTop` before re-render, restored after (plus `requestAnimationFrame` fallback). Resets to 0 on sort/filter/search changes.
 
 ### Sorting
 
-`setSort(col)` permanently sorts `state.transactions` in place and saves state. This means sort order persists across page navigation and browser refresh. `sortedVis()` simply returns the visible (filtered) array as-is — no re-sorting during render.
-
-**Editing never re-sorts.** Changing a group, date, amount, or comment preserves row position.
+`setSort(col)` permanently sorts `state.transactions` in place. Editing never re-sorts.
 
 ### Group Copy/Paste (Ctrl+C / Ctrl+V)
 
-1. Click any group dropdown → `setActiveGrpRow(id)` marks it and **blurs the select** (critical: moves focus away so keyboard events reach `document`)
-2. `Ctrl+C` → copies `groupId` to `copiedGroupId`, shows blue banner
-3. Click another row's group dropdown → marks new active row
-4. `Ctrl+V` → pastes group, calls `learnRule`, re-renders
+1. Click group dropdown → `setActiveGrpRow(id)` + **blur the select** (critical: returns focus to document so keyboard events work)
+2. `Ctrl+C` → copies `groupId`, shows blue banner
+3. Click another row's group dropdown
+4. `Ctrl+V` → pastes group, calls `learnRule`
 
 ### Bulk Selection
 
-Checkbox column + bulk bar. `toggleTx()` updates DOM in-place (no full re-render) for performance — just updates row class and checkbox, plus the bulk bar count. `bulkAssign()` keeps selection after assigning (so user can re-assign or see what changed), calls `learnRule` for each row.
+`toggleTx()` updates DOM in-place (no full re-render) for performance. `bulkAssign()` keeps selection after assigning.
 
 ### Context Menu (Right-click)
 
-Right-click any row to get:
-- ÷ Split into payments… (instalment split)
-- ⧖ Split into 2 transactions
+- ÷ Split into payments…
+- ⧖ Split into 2 transactions (disables original, creates 2 editable copies)
 - ↩ Unsplit
 - ⊘ Disable / ✓ Enable
 - ✎ Edit description
 - 💬 Add/Edit note
 - ✕ Delete
 
-### Split into Payments
-
-Modal with count input and live preview. Creates N instalment transactions with `instalmentOf` pointing to the parent. Parent is marked `splitParent:true` (dimmed, excluded from totals).
-
-Instalment badge shows `3/12` format. **Siblings are sorted by date ascending** before `findIndex` to ensure correct numbering regardless of table sort order.
-
-### Split into 2
-
-Disables original (marked `splitIntoTwo:true`, shown as "split origin" badge), creates 2 copies for user to edit amounts manually.
-
 ### Disabled Transactions
 
-`r.disabled:true` rows are shown at 35% opacity with a "disabled" badge. They are excluded from **all calculations** across every page — totals, charts, group dashboard matrix, exports.
+`r.disabled:true` → shown at 35% opacity, excluded from **all calculations** everywhere.
 
 ---
 
 ## 7. Group Management
 
-### Groups Page Layout
+### Resizable Panel
 
-Resizable two-column layout:
-- Left: transaction list (flex:1)  
-- Drag handle (8px, `cursor:col-resize`)
-- Right: groups panel (default 320px, min 180px, max 600px)
+Two-column layout with drag handle. `initGroupResize()` handles mouse events. Width stored in `grpPanelWidth` (default 320px).
 
-`initGroupResize()` attaches `mousedown` → `mousemove` → `mouseup` listeners. The panel width is stored in `grpPanelWidth`.
+### Group Type Button
 
-### Group Row Controls (on hover)
-
-- Colour swatch → colour picker
-- Name (double-click to rename, or ✎ button)
-- Usage count badge
-- ↑ ↓ reorder buttons (disabled at top/bottom)
-- `income` / `expense` toggle button
-- ✕ delete
+Cycles through three states (click to advance):
+- `expense` (grey border)
+- `income` (green border)  
+- `transfer` (group-colour dashed border, excluded from Income/Expenses)
 
 ### Rename (`saveGrpName`)
 
-On rename:
-1. Updates `g.name` in `state.groups`
+1. Updates `g.name`
 2. Updates all `state.learned` values pointing to old name
-3. Re-runs `learnRule` for all transactions in that group (rebuilds keyword-format rules replacing any old raw-description keys)
+3. Re-runs `learnRule` for all transactions in that group
 
 ### Learned Rules Panel
 
-Shows all n-grams in `state.learned_stats` with confidence bars:
-- ✓ green = active rule (passed threshold)
-- ✗ grey = tracked but ambiguous
-- Confidence bar (green/amber/red)
-- Vote breakdown per group
-- Confidence threshold slider (50%–100%)
-- ⟳ Learn button (rebuilds from all transactions)
-- Manual add rule form
+Shows all n-grams in `state.learned_stats` with confidence bars, vote breakdown, threshold slider (50%–100%), ⟳ Learn button, manual add form.
 
 ---
 
@@ -313,81 +294,59 @@ Shows all n-grams in `state.learned_stats` with confidence bars:
 
 ```javascript
 state.learned_stats = {
-  "trader joe":  { "Groceries": 15 },
-  "uber eats":   { "Dining": 6 },
-  "uber":        { "Transport": 8, "Travel": 5 },
+  "trader joe": { "Groceries": 15 },
+  "uber eats":  { "Dining": 6 },
+  "uber":       { "Transport": 8, "Travel": 5 },
 }
-
 state.learned = {
-  "trader joe": "Groceries",   // passed confidence threshold
+  "trader joe": "Groceries",  // passed confidence threshold
   "uber eats":  "Dining",
-  // "uber" excluded — 62% confidence, below threshold
+  // "uber" excluded — 62% below threshold
 }
 ```
 
 ### N-gram Extraction (`descNgrams`)
 
-For `"TRADER JOE S #127 LOS ALTOS CA"` after cleaning:
-- Lowercased, numbers stripped, 2-letter trailing state stripped
-- Words filtered against stop words
-- Generates all 1, 2, 3-grams
-- Returns longest first (specificity order)
+Lowercases, strips numbers/stop-words/state codes, generates all 1–3-grams, returns longest first.
 
-### Learning (`updateStats`)
-
-Called **only** from the ⟳ Learn button. Scans all assigned, non-disabled, non-split-parent transactions. For each, generates all n-grams and increments vote counts in `learned_stats`.
-
-### Confidence Thresholds
+### Thresholds
 
 ```
-LEARN_CONF_THRESHOLD = 0.70   (70% of votes must be for one group)
-LEARN_MIN_OBS = 2             (minimum total observations)
-LEARN_MIN_WIN = 2             (minimum winning count)
+LEARN_CONF_THRESHOLD = 0.70  (70% of votes must be one group)
+LEARN_MIN_OBS = 2            (minimum total observations)
+LEARN_MIN_WIN = 2            (minimum winning count)
 ```
 
-### `rebuildLearned(threshold)`
+### Learn Only Via Button
 
-Sorts entries by n-gram length descending (longer = more specific). For each n-gram, checks if top group meets threshold and minimum counts. Writes to `state.learned`.
+Individual assignments don't auto-update `learned_stats`. The ⟳ Learn button does a full statistical recalculation, preventing single mis-categorisations from corrupting rules.
 
 ### `guessGroup(desc)`
 
-Generates n-grams for the description, tries longest first, returns first match in `state.learned`. More specific rules (`"uber eats"`) beat less specific (`"uber"`).
-
-### Why "Learn only via button"
-
-Individual group assignments no longer auto-update `learned_stats`. This prevents a single mis-categorisation during a trip from permanently corrupting rules. The Learn button does a full statistical recalculation over all existing data.
+Tries n-grams longest-first → returns first match in `state.learned`. More specific rules (`"uber eats"`) beat less specific (`"uber"`).
 
 ---
 
 ## 9. Dashboard & Charts
 
-### Income / Expense Definition
+### Income / Expense / Transfer Definition
 
-Income and expenses are computed from **group nets**, not raw transaction signs:
+All views share `isIncomeGroup(g)` and `isTransferGroup(g)` helpers:
 
 ```javascript
-// For each month:
-//   1. Sum all transactions per group → grpNet
-//   2. Income groups (isIncome flag or name contains 'משכורת') → totalInc
-//   3. Expense groups → totalExp
-
+function isTransferGroup(g) {
+  return g ? !!g.isTransfer : false;
+}
 function isIncomeGroup(g) {
-  if (!g) return false;
+  if (!g || isTransferGroup(g)) return false;
   if (g.isIncome !== undefined) return !!g.isIncome;
-  return g.name.includes('משכורת');  // fallback name detection
+  return g.name.includes('משכורת');
 }
 ```
 
-This ensures Dashboard, Monthly Summary, and Groups Dashboard all show consistent numbers.
-
 ### Dashboard Chart
 
-Bar chart (Income green, Expenses red) + line (Accumulated balance, purple):
-- All bars go **upward** (absolute values plotted)
-- Colour indicates sign (green = income, red = expense)
-- Line uses single Y-axis shared with bars (`afterFit: axis.width=90` prevents label clipping)
-- Tooltip shows real signed values
-- Accumulated balance line points colour: purple when positive, red when negative
+Bar chart (Income green, Expenses red) + Accumulated balance line (purple). Single Y-axis (`afterFit: axis.width=90`). All use group-based logic via `monthlyGroupTotals()`.
 
 ---
 
@@ -395,29 +354,27 @@ Bar chart (Income green, Expenses red) + line (Accumulated balance, purple):
 
 ### Matrix Table
 
-Rows = groups, Columns = months + Total + (no avg in table).
+Rows = groups, columns = months + Total. Sticky first column. Months with >20 transactions get ✓ badge (used for average).
 
-- Sticky first column (group name)
-- Month columns show transaction count in sub-header
-- Months with > 20 transactions get a ✓ badge and full opacity; others dimmed
-- Qualifying months (> 20 tx) used for average calculation in mini charts
+### Mini Charts
 
-### Mini Charts (per group)
-
-- Bar chart, absolute values, green = positive month, red = negative month
-- Dashed horizontal average line (only shown when qualifying months exist)
-- Average value displayed in card header: `avg -$419.73`
-- Tooltip on bars shows real signed value
+Bar chart per group: absolute values, green/red by sign, dashed average line from qualifying months (>20 tx).
 
 ---
 
 ## 11. Monthly Summary
 
-Per-month breakdown cards showing:
-- **Income**: sum of net for all income groups
-- **Expenses**: sum of net for all expense groups  
-- **Net**: Income + Expenses
-- Group chips sorted most-negative first, coloured green/red by sign
+### Chart
+
+Bar chart of Net per month — uses same group-based logic as month blocks (not raw transaction signs). Transfer groups excluded from net calculation.
+
+### Month Blocks
+
+Per month: Income / Expenses / Net stats + group chips.
+
+**Transfer chips** shown with dashed border, neutral color, tooltip "Transfer (excluded from Income/Expenses)".
+
+**Chip sort:** most negative first.
 
 ---
 
@@ -425,29 +382,15 @@ Per-month breakdown cards showing:
 
 ### Internal Data (JSON)
 
-Full backup including:
-```json
-{
-  "exported_at": "...",
-  "version": "1.0",
-  "date_range": { "from": "...", "to": "..." },
-  "groups": [...],
-  "learned_rules": { "trader joe": "Groceries", ... },
-  "transactions": [...]
-}
-```
+Full backup: groups, learned rules, transactions, date range, version.
 
 ### Transaction Export (CSV / XLSX)
 
-One row per transaction within date range. Columns: date, description, amount, group, source, comment, edited, id.
+One row per transaction. Split-parents excluded.
 
-### Group Summary Export (CSV)
+### Group Summary (CSV)
 
-One row per group: group name, income, expenses, net, transaction count. Split-parent rows excluded from sums.
-
-### Export Preview
-
-Live preview table updates as date range or format changes.
+One row per group: name, income, expenses, net, count.
 
 ---
 
@@ -455,102 +398,108 @@ Live preview table updates as date range or format changes.
 
 ### Snapshots
 
-- `saveSnapshot(name)` — serialises `state` to localStorage
-- `loadSnapshot(id)` — deserialises, sanitises (ensures all required fields exist), auto-sets `isIncome` for משכורת groups
-- `autoSave()` — silent save, only runs when `_autoSaveId` is set
+`saveSnapshot(name)` → `loadSnapshot(id)` → auto-sanitises on every load:
 
-### Welcome Screen
-
-Shown on first open or when no last session. Lists recent saves with Open / Rename / Delete. User can also load from a JSON export file directly.
-
-### Sanitisation on Load
-
-Every load path (`loadSnapshot`, `welcomeLoadFile`) ensures:
 ```javascript
-state.learned      = state.learned      || {};
-state.learned_stats= state.learned_stats|| {};
-state.groups       = state.groups       || [];
-state.transactions = state.transactions || [];
-// Auto-flag income groups by name if flag not explicitly set:
+state.learned       = state.learned       || {};
+state.learned_stats = state.learned_stats || {};
+state.groups        = state.groups        || [];
+state.transactions  = state.transactions  || [];
+// Auto-set flags for old saves:
 state.groups.forEach(g => {
   if (g.isIncome === undefined && g.name.includes('משכורת'))
     g.isIncome = true;
+  if (g.isTransfer === undefined && g.name.toLowerCase().includes('transfer to'))
+    g.isTransfer = true;
 });
 ```
 
 ---
 
-## 14. Income vs Expense Logic
+## 14. Income vs Expense vs Transfer Logic
 
-The income/expense split is **group-based**, not transaction-sign-based.
+Three group types, consistent across all views:
 
-### Why not transaction signs?
+| Type | Dashboard | Monthly Summary | Groups Dashboard | Transactions |
+|------|-----------|-----------------|------------------|--------------|
+| Income | ✓ Counted | ✓ Counted | ✓ Shown | ✓ Shown |
+| Expense | ✓ Counted | ✓ Counted | ✓ Shown | ✓ Shown |
+| Transfer | ✗ Excluded | ✗ Excluded (shown in chips) | ✓ Shown | ✓ Shown |
 
-A salary group (`משכורת`) may contain both positive (salary deposits) and negative (tax withholdings) transactions. Using raw signs would count the tax payments as "expense" even though they belong to the income group. Group-based logic gives the net for the entire group, which is the meaningful number.
+**Default transfer groups:** "Transfer to Savings", "Transfer to Investments".
 
-### Configuration
-
-Each group has an `isIncome` flag toggled in the Groups page. Default detection:
-- `isIncome` explicitly set → use it
-- `isIncome` undefined AND name contains `"משכורת"` → treated as income
-- Otherwise → expense
-
-### Consistency
-
-All four views use the shared `isIncomeGroup(g)` helper:
-1. Dashboard stat cards (all-time totals)
-2. Dashboard chart (monthly bars)
-3. Monthly Summary (per-month Income/Expenses)
-4. Groups Dashboard (matrix and mini charts)
+**Why transfer groups?** Moving money to savings/investments is neither income nor expense — it would distort both totals. Excluding them gives accurate Income and Expense figures while still tracking where the money went.
 
 ---
 
-## 15. Key Design Decisions
+## 15. Transaction Grouping (Year/Month)
 
-### Single File
-No build step, no dependencies to install, works offline. The tradeoff is a large single file that requires careful editing.
+### Motivation
 
-### localStorage Snapshots
-Multiple named sessions allow testing imports without overwriting production data. The snapshot index allows rename/delete without touching transaction data.
+With 1,500+ transactions spanning multiple years, a flat list is unusable. Collapsible year/month groups let the user focus on one period at a time.
 
-### "Learn only via button"
-Prevents accidental learning from mis-categorisations. One-time statistical batch analysis is more reliable than incremental updates.
+### Implementation
 
-### Longer column wins for description
-When a bank CSV has both `description` and `extended description`, always pick the longer one. Different banks use these columns in opposite ways.
+`buildGroupedRows(rows, grpOpts, dupIds)` builds the tbody HTML:
+- Iterates years descending
+- Within each year, iterates months descending  
+- Year/month rows are `<tr>` with `colspan="8"` and `onclick` handlers
+- Transaction rows are normal `txRow()` output — all editing works unchanged
 
-### Sign validation on import
-Block import if Transaction Type disagrees with amount sign. Better to fail loudly than silently import wrong data. The user is told to re-download.
+### State
 
-### No re-sort on edit
-Changing a group, date, or amount preserves row position. Only explicit column header clicks re-sort. This prevents the table "jumping" while categorising.
+```javascript
+let expandedYears  = new Set();  // {"2026"}
+let expandedMonths = new Set();  // {"2026-06", "2026-05"}
+```
 
-### `oninput` not `onchange` in review table
-`onchange` fires when an input loses focus AND the value differs from when it gained focus. Some browsers fire this during chunk-based DOM insertion, corrupting amounts (stripping minus signs from number inputs). `oninput` only fires on actual user typing.
+Auto-expands most recent year + month on first render.
+
+### Performance
+
+Only expanded months render full `txRow()` HTML. With 1,500 transactions and one month open (28 rows), initial render is near-instant.
 
 ---
 
-## 16. Known Patterns & Edge Cases
+## 16. Key Design Decisions
 
-### Floating Point Amounts
-All displayed amounts are rounded to 2 decimal places before colour/sign decisions using `Math.round(v * 100) / 100` to prevent `-0.000000001` showing as red when the display value is `$0.00`.
+**Single File** — No build step, works offline, easy to share.
 
-### Hebrew Group Names
-The codebase uses Hebrew text directly (UTF-8). The `משכורת` (salary) keyword is used as the income group auto-detection fallback.
+**localStorage Snapshots** — Multiple named sessions allow testing without overwriting production data.
 
-### Chunk Rendering Race Condition
-When `showImportReview` renders rows in chunks via `setTimeout`, any `onchange` event firing during insertion could corrupt field values. Solution: use `oninput` for amount/date fields, and make description read-only with an explicit edit button.
+**Longer column wins** — Always pick the longer of `description` vs `extended description`. Different banks use these columns in opposite ways.
 
-### Instalment Badge Ordering
-`findIndex` among instalment siblings must sort by date ascending first — otherwise the badge number depends on the current table sort order, not the instalment sequence.
+**Sign validation on import** — Block if Transaction Type disagrees with amount sign. Better to fail loudly.
 
-### Credit Card Sign Convention
-Some banks export credit card debits as positive amounts (wrong convention). The import validates that Debit = negative and Credit = positive, and blocks with an error if violated.
+**`oninput` not `onchange` in review table** — `onchange` fires during chunk-based DOM insertion, corrupting amounts (strips minus signs from number inputs).
 
-### Ctrl+C Interception
-When a `<select>` has focus, browsers intercept Ctrl+C for their own copy. Fix: `setActiveGrpRow()` immediately calls `document.activeElement.blur()` after registering the row, returning focus to document so the keyboard handler receives the event.
+**Learn only via button** — Prevents mis-categorisations during a trip from corrupting rules permanently.
+
+**No re-sort on edit** — Changing group/date/amount preserves row position. Only explicit column header clicks re-sort.
+
+**Group-based Income/Expense** — Using raw transaction signs would count tax withholdings inside a salary group as expenses. Group nets give the meaningful number.
+
+**Transfer group type** — Moving money between accounts should not inflate Income or Expenses. A dedicated transfer type excludes these from totals while keeping them visible everywhere else.
+
+---
+
+## 17. Known Patterns & Edge Cases
+
+**Floating point amounts** — `Math.round(v * 100) / 100` before colour decisions prevents `-0.000000001` showing as red.
+
+**Hebrew group names** — UTF-8 throughout. `'משכורת'` (salary) used as income auto-detection fallback keyword.
+
+**Instalment badge ordering** — Siblings sorted by date ascending before `findIndex` — prevents badge number depending on current table sort order.
+
+**Credit card sign convention** — Some banks export debits as positive. Import validates and blocks with error if violated.
+
+**Ctrl+C interception** — `setActiveGrpRow()` calls `document.activeElement.blur()` immediately so keyboard events reach `document` handler, not the focused `<select>`.
+
+**Chunk rendering race condition** — `oninput` instead of `onchange` on review table amount/date inputs prevents browser from firing change events during DOM insertion.
+
+**Year/month grouping + search** — When search/filter is active, only groups containing matching transactions are shown. Expand/collapse state preserved independently.
 
 ---
 
 *Last updated: July 2026*  
-*Application: finance-tracker.html (~3,000 lines)*
+*Application: finance-tracker.html (~3,100 lines)*
