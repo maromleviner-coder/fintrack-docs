@@ -503,3 +503,17 @@ Only expanded months render full `txRow()` HTML. With 1,500 transactions and one
 
 *Last updated: July 2026*  
 *Application: finance-tracker.html (~3,100 lines)*
+
+---
+
+## 18. Changelog — Latest Fixes
+
+### Transfer group consistency in Transactions tab
+- `groupStats(txRows)` helper added — computes income/expenses using `isIncomeGroup`/`isTransferGroup`, transfer groups excluded
+- Year/month group header rows in `buildGroupedRows` now use `groupStats()` — previously used raw transaction signs, causing July 2026 to show wrong Net
+- Transactions page stat cards (Income/Expenses/Net) also switched to `groupStats()`
+- All four views (Dashboard, Monthly Summary, Groups Dashboard, Transactions) now use identical income/expense/transfer logic
+
+### Monthly Summary chart fix
+- "Net per month" bar chart was using raw transaction signs while month blocks used group-based logic
+- Chart now uses same group-based calculation — Net bar matches the number shown in the month block below it
