@@ -517,3 +517,8 @@ Only expanded months render full `txRow()` HTML. With 1,500 transactions and one
 ### Monthly Summary chart fix
 - "Net per month" bar chart was using raw transaction signs while month blocks used group-based logic
 - Chart now uses same group-based calculation — Net bar matches the number shown in the month block below it
+
+### Dashboard chart sign fixes
+- Removed `Math.max(0,inc)` and `Math.min(0,exp)` clamping from `monthlyGroupTotals()` and `groupStats()` — income groups can net negative in some months (e.g. tax withholding month), expense groups can net positive (refunds)
+- Dashboard chart bars now use `Math.abs()` for height with dynamic colour (green when income positive, red when negative)
+- Stored original signed arrays `monthlyIncSigned`/`monthlyExpSigned` alongside absolute bar heights — tooltip callback uses `dataIndex` to look up real signed value, fixing incorrect `Expenses: -$0.00` display
