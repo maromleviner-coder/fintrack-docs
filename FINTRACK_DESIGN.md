@@ -522,3 +522,109 @@ Only expanded months render full `txRow()` HTML. With 1,500 transactions and one
 - Removed `Math.max(0,inc)` and `Math.min(0,exp)` clamping from `monthlyGroupTotals()` and `groupStats()` — income groups can net negative in some months (e.g. tax withholding month), expense groups can net positive (refunds)
 - Dashboard chart bars now use `Math.abs()` for height with dynamic colour (green when income positive, red when negative)
 - Stored original signed arrays `monthlyIncSigned`/`monthlyExpSigned` alongside absolute bar heights — tooltip callback uses `dataIndex` to look up real signed value, fixing incorrect `Expenses: -$0.00` display
+
+---
+
+## 19. Yearly Summary Page
+
+### Overview
+A new sidebar page ("Yearly summary") that analyses each year's finances, projects full-year figures for partial years, and breaks down actuals and projections per group.
+
+**Minimum data threshold:** a year must have at least 3 months of data to appear.
+
+---
+
+### Layout
+
+One card per year, most recent first. Each card has:
+
+- Year label + status badge (Complete year / Partial — N of 12 months)
+- From/To month range dropdowns (user-adjustable)
+- 3 stat cards: Income / Expenses / Net — each shows Actual and (for partial years) Projected
+- Optional warning if current calendar month is in the range
+- Per-group breakdown table with mini bar charts
+
+---
+
+### Projection Formula
+
+For partial years (selected range < 12 months):
+
+```
+avg_per_month = actual / months_in_range
+projected_12  = actual + (avg_per_month * remaining_months)
+```
+
+Where remaining_months = 12 - months_in_range.
+
+This gives: actual-so-far + estimated future, not just a scaled total.
+For complete years: no projection shown — actual IS the answer.
+
+---
+
+### Range Selection
+
+Each year card has From / To month dropdowns.
+
+Defaults:
+- From = earliest month with data in that year
+- To = last complete month — if current calendar month is in this year, default To is the previous month (avoids partial-month distortion)
+
+Behaviour on change: immediately recalculates all stats and redraws mini charts for that year.
+
+State: yearRanges = { "2027": { from: "2027-01", to: "2027-04" } } — persists within session.
+
+---
+
+### Current Month Warning
+
+If the current calendar month falls within the selected range:
+"April 2027 is in progress — projection may be understated. Consider adjusting the end month."
+
+---
+
+### Per-group Breakdown
+
+Three sections per year card: Income groups, Expense groups, Transfers.
+
+Groups with zero activity in the selected range are hidden.
+
+Columns:
+- Group (coloured pill)
+- Monthly trend (mini bar chart, one bar per month, green/red by sign, signed tooltip)
+- Actual (sum over selected range)
+- Avg / month (actual / months in range)
+- Projected (12mo) — hidden for complete years
+
+Groups sorted by absolute actual descending.
+
+---
+
+### Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| renderYearlySummary() | Main renderer — builds all year cards, draws charts |
+| setYearRange(y, field, val) | Dropdown handler — re-renders single year body + charts |
+| renderYearBody(...) | Returns HTML for one year's stats + group tables |
+| drawYearCharts(y, from, to, tx) | Draws mini Chart.js bar charts for all active groups |
+
+State variables: yearRanges, yrChartInstances, MIN_MONTHS_FOR_YEAR = 3
+
+---
+
+## 20. Monthly Summary Chart Fix
+
+The Net per month bar chart had mismatched colours because data was reversed but backgroundColor/borderColor arrays were not.
+
+Fix: compute netReversed = [...netByMonth].reverse() first, then derive all three arrays from the same reversed source. Also added proper signed tooltip: Net: +$4,123.45 / Net: -$8,234.56.
+
+---
+
+## 21. Transfer Group Consistency Fixes
+
+- groupStats() helper added — computes income/expenses using isIncomeGroup/isTransferGroup, transfer groups excluded
+- Year/month group header rows in buildGroupedRows now use groupStats()
+- Transactions page stat cards also use groupStats()
+- Dashboard chart stores original signed arrays (monthlyIncSigned/monthlyExpSigned) for correct tooltip display
+- Removed Math.max(0,inc) and Math.min(0,exp) clamping — income groups can net negative in some months
